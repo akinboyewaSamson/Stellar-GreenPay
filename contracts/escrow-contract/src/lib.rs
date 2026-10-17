@@ -4,7 +4,8 @@
 //! Client locks funds with `create_job`, then releases them per milestone.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, String,
+    Symbol, Vec,
 };
 
 #[contracttype]
@@ -28,7 +29,7 @@ pub enum JobStatus {
 #[derive(Clone, Debug)]
 pub struct Milestone {
     pub name: String,
-    pub percentage: u32,  // 0-100
+    pub percentage: u32, // 0-100
     pub released: bool,
 }
 
@@ -56,6 +57,48 @@ pub enum DataKey {
 
 pub const RELEASE_AFTER_LEDGERS: u32 = 10;
 
+fn percentage_amount(amount: i128, percentage: u32) -> i128 {
+    let percentage = percentage as i128;
+    let whole = (amount / 100)
+        .checked_mul(percentage)
+        .expect("Milestone amount overflow");
+    let fractional = (amount % 100)
+        .checked_mul(percentage)
+        .expect("Milestone amount overflow")
+        / 100;
+    whole
+        .checked_add(fractional)
+        .expect("Milestone amount overflow")
+}
+
+fn milestone_amount(amount: i128, milestones: &Vec<Milestone>, milestone_index: u32) -> i128 {
+    let mut cumulative_percentage = 0u32;
+    let mut previous_amount = 0i128;
+    let mut index = 0u32;
+
+    while index <= milestone_index {
+        let milestone = milestones.get(index).expect("Invalid milestone index");
+        cumulative_percentage = cumulative_percentage
+            .checked_add(milestone.percentage)
+            .expect("Milestone percentage overflow");
+        if cumulative_percentage > 100 {
+            panic!("Milestones must sum to 100%");
+        }
+
+        let cumulative_amount = percentage_amount(amount, cumulative_percentage);
+        if index == milestone_index {
+            return cumulative_amount
+                .checked_sub(previous_amount)
+                .expect("Milestone amount underflow");
+        }
+
+        previous_amount = cumulative_amount;
+        index += 1;
+    }
+
+    panic!("Invalid milestone index");
+}
+
 #[contract]
 pub struct EscrowContract;
 
@@ -63,6 +106,7 @@ pub struct EscrowContract;
 impl EscrowContract {
     /// Initialize contract with admin address.
     pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
@@ -88,9 +132,7 @@ impl EscrowContract {
 
     /// Get the configured GreenPay contract ID.
     pub fn get_greenpay_contract(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::GreenPayContractId)
+        env.storage().instance().get(&DataKey::GreenPayContractId)
     }
 
     /// Internal helper to check if the main GreenPay contract is paused.
@@ -140,12 +182,8 @@ impl EscrowContract {
         if proposed_admin != new_admin {
             panic!("Not the proposed admin");
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin, &new_admin);
-        env.storage()
-            .instance()
-            .remove(&DataKey::ProposedAdmin);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::ProposedAdmin);
     }
 
     /// Get the current admin address.
@@ -158,9 +196,7 @@ impl EscrowContract {
 
     /// Get the proposed admin address, if any.
     pub fn get_proposed_admin(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::ProposedAdmin)
+        env.storage().instance().get(&DataKey::ProposedAdmin)
     }
 
     /// Client funds escrow with milestones: transfers `amount` of `token` from client into this contract.
@@ -175,7 +211,7 @@ impl EscrowContract {
     ) {
         client.require_auth();
         Self::check_pause_state(&env);
-        
+
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -186,13 +222,22 @@ impl EscrowContract {
         // Validate milestones sum to 100%
         let mut total_percentage: u32 = 0;
         for milestone in milestones.iter() {
-            total_percentage = total_percentage.checked_add(milestone.percentage)
+            if milestone.released {
+                panic!("New milestones cannot already be released");
+            }
+            total_percentage = total_percentage
+                .checked_add(milestone.percentage)
                 .expect("Milestone percentage overflow");
         }
         if total_percentage != 100 {
             panic!("Milestones must sum to 100%");
         }
 
+        let release_after = env
+            .ledger()
+            .sequence()
+            .checked_add(RELEASE_AFTER_LEDGERS)
+            .expect("Release ledger overflow");
         let token_client = token::Client::new(&env, &token);
         let contract_addr = env.current_contract_address();
         token_client.transfer(&client, &contract_addr, &amount);
@@ -206,7 +251,7 @@ impl EscrowContract {
             status: JobStatus::Escrowed,
             milestones,
             disputed: false,
-            release_after: env.ledger().sequence() + RELEASE_AFTER_LEDGERS,
+            release_after,
         };
         env.storage().instance().set(&DataKey::Job(job_id), &job);
     }
@@ -215,7 +260,7 @@ impl EscrowContract {
     pub fn release_milestone(env: Env, client: Address, job_id: String, milestone_index: u32) {
         client.require_auth();
         Self::check_pause_state(&env);
-        
+
         let mut job: Job = env
             .storage()
             .instance()
@@ -236,14 +281,20 @@ impl EscrowContract {
         if milestone.released {
             panic!("Milestone already released");
         }
+        if job.status == JobStatus::Completed {
+            panic!("Job is already completed");
+        }
 
         // Calculate proportional amount
-        let proportion = milestone.percentage as i128;
-        let release_amount = (job.amount * proportion) / 100i128;
+        let release_amount = milestone_amount(job.amount, &job.milestones, milestone_index);
 
-        let token_client = token::Client::new(&env, &job.token);
-        let contract_addr = env.current_contract_address();
-        token_client.transfer(&contract_addr, &job.freelancer, &release_amount);
+        // The token transfer and job update are one Soroban invocation: on transfer failure
+        // the ledger rolls back both, leaving this milestone available for a safe retry.
+        if release_amount > 0 {
+            let token_client = token::Client::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.freelancer, &release_amount);
+        }
 
         // Mark milestone as released and count total released
         let mut updated_milestones: Vec<Milestone> = Vec::new(&env);
@@ -256,7 +307,9 @@ impl EscrowContract {
                 m.released = true;
             }
             if m.released {
-                released_count = released_count.checked_add(1).expect("released_count overflow");
+                released_count = released_count
+                    .checked_add(1)
+                    .expect("released_count overflow");
             }
             updated_milestones.push_back(m);
             idx += 1;
@@ -287,6 +340,9 @@ impl EscrowContract {
         if job.client != client && job.freelancer != client {
             panic!("Only client or freelancer can raise dispute");
         }
+        if job.status == JobStatus::Completed {
+            panic!("Job is already completed");
+        }
         job.disputed = true;
         job.status = JobStatus::Disputed;
         env.storage().instance().set(&DataKey::Job(job_id), &job);
@@ -296,9 +352,12 @@ impl EscrowContract {
     pub fn resolve_dispute(env: Env, admin: Address, job_id: String, release_to_freelancer: bool) {
         admin.require_auth();
         Self::check_pause_state(&env);
-        
-        let stored_admin: Address = env.storage().instance()
-            .get(&DataKey::Admin).expect("Not initialized");
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
         if stored_admin != admin {
             panic!("Only admin can resolve disputes");
         }
@@ -313,46 +372,33 @@ impl EscrowContract {
             panic!("Job is not disputed");
         }
 
-        if release_to_freelancer {
-            // Release all unreleased milestones
-            let mut total_unreleased: i128 = 0;
-            for milestone in job.milestones.iter() {
-                if !milestone.released {
-                    let proportion = milestone.percentage as i128;
-                    total_unreleased = total_unreleased.checked_add(
-                        (job.amount * proportion) / 100i128
-                    ).expect("total_unreleased overflow");
-                }
+        let mut remaining_amount = 0i128;
+        let mut updated_milestones = Vec::new(&env);
+        let mut index = 0u32;
+        for mut milestone in job.milestones.iter() {
+            if !milestone.released {
+                remaining_amount = remaining_amount
+                    .checked_add(milestone_amount(job.amount, &job.milestones, index))
+                    .expect("Remaining amount overflow");
+                milestone.released = true;
             }
-
-            if total_unreleased > 0 {
-                let token_client = token::Client::new(&env, &job.token);
-                let contract_addr = env.current_contract_address();
-                token_client.transfer(&contract_addr, &job.freelancer, &total_unreleased);
-            }
-
-            job.status = JobStatus::Completed;
-        } else {
-            // Return funds to client (refund)
-            let mut remaining_amount: i128 = 0;
-            for milestone in job.milestones.iter() {
-                if !milestone.released {
-                    let proportion = milestone.percentage as i128;
-                    remaining_amount = remaining_amount.checked_add(
-                        (job.amount * proportion) / 100i128
-                    ).expect("remaining_amount overflow");
-                }
-            }
-
-            if remaining_amount > 0 {
-                let token_client = token::Client::new(&env, &job.token);
-                let contract_addr = env.current_contract_address();
-                token_client.transfer(&contract_addr, &job.client, &remaining_amount);
-            }
-
-            job.status = JobStatus::Completed;
+            updated_milestones.push_back(milestone);
+            index += 1;
         }
 
+        if remaining_amount > 0 {
+            let recipient = if release_to_freelancer {
+                &job.freelancer
+            } else {
+                &job.client
+            };
+            let token_client = token::Client::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, recipient, &remaining_amount);
+        }
+
+        job.milestones = updated_milestones;
+        job.status = JobStatus::Completed;
         job.disputed = false;
         env.storage().instance().set(&DataKey::Job(job_id), &job);
     }
@@ -361,9 +407,16 @@ impl EscrowContract {
     pub fn claim_milestone(env: Env, freelancer: Address, job_id: String, milestone_index: u32) {
         freelancer.require_auth();
         Self::check_pause_state(&env);
-        
-        let mut job: Job = env.storage().instance().get(&DataKey::Job(job_id.clone())).expect("Job not found");
 
+        let mut job: Job = env
+            .storage()
+            .instance()
+            .get(&DataKey::Job(job_id.clone()))
+            .expect("Job not found");
+
+        if job.freelancer != freelancer {
+            panic!("Only the freelancer can claim");
+        }
         if job.disputed {
             panic!("Job is disputed; cannot claim milestone");
         }
@@ -377,12 +430,16 @@ impl EscrowContract {
         if milestone.released {
             panic!("Milestone already released");
         }
+        if job.status == JobStatus::Completed {
+            panic!("Job is already completed");
+        }
         // Calculate amount
-        let proportion = milestone.percentage as i128;
-        let release_amount = (job.amount * proportion) / 100i128;
-        let token_client = token::Client::new(&env, &job.token);
-        let contract_addr = env.current_contract_address();
-        token_client.transfer(&contract_addr, &job.freelancer, &release_amount);
+        let release_amount = milestone_amount(job.amount, &job.milestones, milestone_index);
+        if release_amount > 0 {
+            let token_client = token::Client::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.freelancer, &release_amount);
+        }
 
         // Mark as released
         let mut updated_milestones: Vec<Milestone> = Vec::new(&env);
@@ -403,7 +460,11 @@ impl EscrowContract {
         job.milestones = updated_milestones;
 
         // Update status
-        job.status = if all_released { JobStatus::Completed } else { JobStatus::PartiallyReleased };
+        job.status = if all_released {
+            JobStatus::Completed
+        } else {
+            JobStatus::PartiallyReleased
+        };
 
         env.storage().instance().set(&DataKey::Job(job_id), &job);
     }
@@ -439,31 +500,38 @@ impl EscrowContract {
         }
 
         let mut total_unreleased: i128 = 0;
+        let mut has_unreleased = false;
         let mut updated_milestones: Vec<Milestone> = Vec::new(&env);
+        let mut index = 0u32;
         for milestone in job.milestones.iter() {
             let mut m = milestone.clone();
             if !m.released {
-                let proportion = m.percentage as i128;
-                let milestone_amount = (job.amount * proportion) / 100i128;
+                has_unreleased = true;
+                let amount = milestone_amount(job.amount, &job.milestones, index);
                 total_unreleased = total_unreleased
-                    .checked_add(milestone_amount)
-                    .expect("total_unreleased overflow");
+                    .checked_add(amount)
+                    .expect("Remaining amount overflow");
                 m.released = true;
             }
             updated_milestones.push_back(m);
+            index += 1;
         }
 
-        if total_unreleased == 0 {
+        if !has_unreleased {
             panic!("No unreleased funds available");
         }
 
-        let token_client = token::Client::new(&env, &job.token);
-        let contract_addr = env.current_contract_address();
-        token_client.transfer(&contract_addr, &job.freelancer, &total_unreleased);
+        if total_unreleased > 0 {
+            let token_client = token::Client::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.freelancer, &total_unreleased);
+        }
 
         job.milestones = updated_milestones;
         job.status = JobStatus::Completed;
-        env.storage().instance().set(&DataKey::Job(job_id.clone()), &job);
+        env.storage()
+            .instance()
+            .set(&DataKey::Job(job_id.clone()), &job);
 
         // Emit FundsReleased event anchoring the project_report_hash
         env.events().publish(
@@ -495,6 +563,17 @@ mod tests {
         let admin = Address::generate(env);
         client.initialize(&admin);
         (admin, client)
+    }
+
+    #[test]
+    fn test_initialize_requires_admin_auth() {
+        let env = Env::default();
+        let cid = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &cid);
+        let admin = Address::generate(&env);
+
+        assert!(client.try_initialize(&admin).is_err());
+        assert!(client.try_get_admin().is_err());
     }
 
     #[test]
@@ -561,7 +640,9 @@ mod tests {
         let freelancer = Address::generate(&env);
         // Use a real Stellar asset token so create_job's transfer succeeds
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
         let job_id = String::from_str(&env, "job-1");
 
@@ -583,11 +664,408 @@ mod tests {
             released: false,
         });
 
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
 
         let job = client.get_job(&job_id).expect("Job should exist");
         assert_eq!(job.status, JobStatus::Escrowed);
         assert_eq!(job.milestones.len(), 3);
+    }
+
+    #[test]
+    fn test_milestone_rounding_releases_exact_escrow_amount_out_of_order() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &101i128);
+        let job_id = String::from_str(&env, "job-rounded");
+
+        let mut milestones = Vec::new(&env);
+        for percentage in [33, 33, 34].iter() {
+            milestones.push_back(Milestone {
+                name: String::from_str(&env, "Milestone"),
+                percentage: *percentage,
+                released: false,
+            });
+        }
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &101i128,
+            &milestones,
+        );
+        client.release_milestone(&client_addr, &job_id, &2u32);
+        client.release_milestone(&client_addr, &job_id, &0u32);
+        client.release_milestone(&client_addr, &job_id, &1u32);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&freelancer), 101i128);
+        let job = client.get_job(&job_id).expect("Job should exist");
+        assert_eq!(job.status, JobStatus::Completed);
+        for milestone in job.milestones.iter() {
+            assert!(milestone.released);
+        }
+    }
+
+    #[test]
+    fn test_failed_token_transfer_preserves_milestone_for_retry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &cid);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&client_addr, &1000i128);
+        let job_id = String::from_str(&env, "job-retry");
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "All"),
+            percentage: 100,
+            released: false,
+        });
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
+        token_admin_client.clawback(&cid, &1000i128);
+
+        let failed = client.try_release_milestone(&client_addr, &job_id, &0u32);
+        assert!(failed.is_err());
+        let job = client
+            .get_job(&job_id)
+            .expect("Job should remain persisted");
+        assert_eq!(job.status, JobStatus::Escrowed);
+        assert!(!job.milestones.get(0).unwrap().released);
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&freelancer),
+            0
+        );
+
+        token_admin_client.mint(&cid, &1000i128);
+        client.release_milestone(&client_addr, &job_id, &0u32);
+        let job = client
+            .get_job(&job_id)
+            .expect("Job should remain persisted");
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(job.milestones.get(0).unwrap().released);
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&freelancer),
+            1000
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the freelancer can claim")]
+    fn test_claim_milestone_rejects_non_freelancer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &100i128);
+        let job_id = String::from_str(&env, "job-unauthorized-claim");
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "All"),
+            percentage: 100,
+            released: false,
+        });
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &100i128,
+            &milestones,
+        );
+        client.claim_milestone(&unauthorized, &job_id, &0u32);
+    }
+
+    #[test]
+    fn test_dispute_refund_marks_milestones_settled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &100i128);
+        let job_id = String::from_str(&env, "job-refund");
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "First"),
+            percentage: 40,
+            released: false,
+        });
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "Second"),
+            percentage: 60,
+            released: false,
+        });
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &100i128,
+            &milestones,
+        );
+        client.release_milestone(&client_addr, &job_id, &0u32);
+        client.raise_dispute(&client_addr, &job_id);
+        client.resolve_dispute(&_admin, &job_id, &false);
+
+        let job = client.get_job(&job_id).expect("Job should exist");
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(!job.disputed);
+        for milestone in job.milestones.iter() {
+            assert!(milestone.released);
+        }
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&client_addr),
+            60
+        );
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&freelancer),
+            40
+        );
+    }
+
+    #[test]
+    fn test_failed_dispute_settlement_preserves_remaining_milestones_for_retry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&client_addr, &100i128);
+        let job_id = String::from_str(&env, "job-dispute-retry");
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "First"),
+            percentage: 40,
+            released: false,
+        });
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "Second"),
+            percentage: 60,
+            released: false,
+        });
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &100i128,
+            &milestones,
+        );
+        client.release_milestone(&client_addr, &job_id, &0u32);
+        client.raise_dispute(&client_addr, &job_id);
+        token_admin_client.clawback(&contract_id, &60i128);
+
+        assert!(client.try_resolve_dispute(&admin, &job_id, &true).is_err());
+        let job = client
+            .get_job(&job_id)
+            .expect("Job should remain persisted");
+        assert_eq!(job.status, JobStatus::Disputed);
+        assert!(job.disputed);
+        assert!(job.milestones.get(0).unwrap().released);
+        assert!(!job.milestones.get(1).unwrap().released);
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&freelancer),
+            40
+        );
+
+        token_admin_client.mint(&contract_id, &60i128);
+        client.resolve_dispute(&admin, &job_id, &true);
+        let job = client
+            .get_job(&job_id)
+            .expect("Job should remain persisted");
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(!job.disputed);
+        for milestone in job.milestones.iter() {
+            assert!(milestone.released);
+        }
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&freelancer),
+            100
+        );
+    }
+
+    #[test]
+    fn test_dispute_release_marks_milestones_settled_and_blocks_replay() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup(&env);
+
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &100i128);
+        let job_id = String::from_str(&env, "job-dispute-release");
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "First"),
+            percentage: 25,
+            released: false,
+        });
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "Second"),
+            percentage: 75,
+            released: false,
+        });
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &100i128,
+            &milestones,
+        );
+        client.raise_dispute(&client_addr, &job_id);
+        client.resolve_dispute(&admin, &job_id, &true);
+
+        let job = client.get_job(&job_id).expect("Job should exist");
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(!job.disputed);
+        for milestone in job.milestones.iter() {
+            assert!(milestone.released);
+        }
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&freelancer),
+            100
+        );
+        assert!(client
+            .try_release_milestone(&client_addr, &job_id, &0u32)
+            .is_err());
+    }
+
+    #[test]
+    fn test_release_funds_settles_zero_value_rounding_remainder() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup(&env);
+
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1i128);
+        let job_id = String::from_str(&env, "job-zero-remainder");
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "Rounded to zero"),
+            percentage: 99,
+            released: false,
+        });
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "Final unit"),
+            percentage: 1,
+            released: false,
+        });
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1i128,
+            &milestones,
+        );
+        client.release_milestone(&client_addr, &job_id, &1u32);
+        let released =
+            client.release_funds(&admin, &job_id, &BytesN::from_array(&env, &[0x42; 32]));
+
+        assert_eq!(released, 0);
+        let job = client.get_job(&job_id).expect("Job should exist");
+        assert_eq!(job.status, JobStatus::Completed);
+        for milestone in job.milestones.iter() {
+            assert!(milestone.released);
+        }
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token).balance(&freelancer),
+            1
+        );
+    }
+
+    #[test]
+    fn test_percentage_amount_handles_maximum_i128_without_overflow() {
+        assert_eq!(percentage_amount(i128::MAX, 100), i128::MAX);
+        let one_percent_rounded_up = i128::MAX / 100 + if i128::MAX % 100 == 0 { 0 } else { 1 };
+        assert_eq!(
+            percentage_amount(i128::MAX, 99),
+            i128::MAX - one_percent_rounded_up
+        );
+
+        let env = Env::default();
+        let mut milestones = Vec::new(&env);
+        for percentage in [33u32, 33, 34].iter() {
+            milestones.push_back(Milestone {
+                name: String::from_str(&env, "Boundary"),
+                percentage: *percentage,
+                released: false,
+            });
+        }
+        let total = (0..3).fold(0i128, |sum, index| {
+            sum + milestone_amount(i128::MAX, &milestones, index)
+        });
+        assert_eq!(total, i128::MAX);
     }
 
     #[test]
@@ -615,7 +1093,41 @@ mod tests {
         });
         // Only 90%, should panic
 
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "New milestones cannot already be released")]
+    fn test_create_job_rejects_pre_released_milestone() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+        let client_addr = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let job_id = String::from_str(&env, "job-pre-released");
+        let token = Address::generate(&env);
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, "Already paid"),
+            percentage: 100,
+            released: true,
+        });
+
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
     }
 
     #[test]
@@ -638,7 +1150,9 @@ mod tests {
         let freelancer = Address::generate(&env);
         // Use a real Stellar asset token so create_job's transfer succeeds
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
         let job_id = String::from_str(&env, "job-dispute");
 
@@ -649,7 +1163,14 @@ mod tests {
             released: false,
         });
 
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
 
         // Dispute the job
         client.raise_dispute(&client_addr, &job_id);
@@ -668,7 +1189,9 @@ mod tests {
         let client_addr = Address::generate(&env);
         let freelancer = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
         let job_id = String::from_str(&env, "job-evidence-1");
 
@@ -679,7 +1202,14 @@ mod tests {
             released: false,
         });
 
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
 
         let report_hash = BytesN::from_array(&env, &[0xab; 32]);
         let released = client.release_funds(&admin, &job_id, &report_hash);
@@ -704,7 +1234,9 @@ mod tests {
         let freelancer = Address::generate(&env);
         let unauthorized = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
         let job_id = String::from_str(&env, "job-unauth");
 
@@ -715,7 +1247,14 @@ mod tests {
             released: false,
         });
 
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
 
         let report_hash = BytesN::from_array(&env, &[0xcd; 32]);
         client.release_funds(&unauthorized, &job_id, &report_hash);
@@ -755,7 +1294,7 @@ mod tests {
 
         // Register a mock GreenPay contract that returns is_paused = true
         let greenpay_cid = env.register_contract(None, MockPausedGreenPayContract);
-        
+
         // Initialize the mock contract to return paused = true
         env.invoke_contract::<()>(
             &greenpay_cid,
@@ -768,7 +1307,9 @@ mod tests {
         let client_addr = Address::generate(&env);
         let freelancer = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
         let job_id = String::from_str(&env, "job-paused");
 
@@ -780,7 +1321,14 @@ mod tests {
         });
 
         // This should panic with "GreenPay contract is paused"
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
     }
 
     #[test]
@@ -793,7 +1341,9 @@ mod tests {
         let client_addr = Address::generate(&env);
         let freelancer = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
         let job_id = String::from_str(&env, "job-pause-release");
 
@@ -805,18 +1355,25 @@ mod tests {
         });
 
         // Create job first (without pause)
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
 
         // Now set up paused GreenPay contract
         let greenpay_cid = env.register_contract(None, MockPausedGreenPayContract);
-        
+
         // Initialize the mock contract to return paused = true
         env.invoke_contract::<()>(
             &greenpay_cid,
             &Symbol::new(&env, "initialize"),
             soroban_sdk::vec![&env, true.into()],
         );
-        
+
         client.set_greenpay_contract(&admin, &greenpay_cid);
 
         // This should panic with "GreenPay contract is paused"
@@ -831,7 +1388,7 @@ mod tests {
 
         // Register a mock GreenPay contract that returns is_paused = false
         let greenpay_cid = env.register_contract(None, MockPausedGreenPayContract);
-        
+
         // Initialize the mock contract to return paused = false
         env.invoke_contract::<()>(
             &greenpay_cid,
@@ -844,7 +1401,9 @@ mod tests {
         let client_addr = Address::generate(&env);
         let freelancer = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client_addr, &1000i128);
         let job_id = String::from_str(&env, "job-not-paused");
 
@@ -856,7 +1415,14 @@ mod tests {
         });
 
         // This should succeed
-        client.create_job(&client_addr, &freelancer, &job_id, &token, &1000i128, &milestones);
+        client.create_job(
+            &client_addr,
+            &freelancer,
+            &job_id,
+            &token,
+            &1000i128,
+            &milestones,
+        );
 
         let job = client.get_job(&job_id).expect("Job should exist");
         assert_eq!(job.status, JobStatus::Escrowed);
@@ -864,21 +1430,23 @@ mod tests {
 
     // ─── Mock GreenPay Contract for Testing Pause ────────────────────────────────
 
-// Test-only. `#[contractimpl]` emits one exported WASM symbol per function, so a
-// non-test build would define `initialize` here as well as on EscrowContract
-// and the release wasm32 build fails with "symbol `initialize` is already
-// defined". Host `cargo check`/`cargo test` do not export symbols, which is why
-// only the wasm build catches it.
-#[cfg(test)]
-#[contract]
-pub struct MockPausedGreenPayContract;
+    // Test-only. `#[contractimpl]` emits one exported WASM symbol per function, so a
+    // non-test build would define `initialize` here as well as on EscrowContract
+    // and the release wasm32 build fails with "symbol `initialize` is already
+    // defined". Host `cargo check`/`cargo test` do not export symbols, which is why
+    // only the wasm build catches it.
+    #[cfg(test)]
+    #[contract]
+    pub struct MockPausedGreenPayContract;
 
-#[cfg(test)]
-#[contractimpl]
-impl MockPausedGreenPayContract {
-    pub fn initialize(env: Env, paused: bool) {
-        env.storage().instance().set(&symbol_short!("paused"), &paused);
-    }
+    #[cfg(test)]
+    #[contractimpl]
+    impl MockPausedGreenPayContract {
+        pub fn initialize(env: Env, paused: bool) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("paused"), &paused);
+        }
 
         pub fn is_paused(env: Env) -> bool {
             env.storage()
