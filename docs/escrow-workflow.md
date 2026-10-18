@@ -418,6 +418,8 @@ stellar contract deploy \
   --network testnet
 ```
 
+Initialize the deployed contract with the intended admin address, signing the initialization transaction with that admin. The escrow contract requires the admin's authorization during initialization.
+
 Set the returned contract ID in both environment files:
 
 ```bash
